@@ -21,16 +21,16 @@ func (c *Conf) save() {
 func (c *Conf) new() {
 	c.self = "host.example.com"
 	c.zones = []Zone{Zone{}}
-	c.client_port = 6442
-	c.host_port = 3002
+	c.clientPort = 6442
+	c.hostPort = 3002
 	c.autonomous = false
 	c.my_zone = &c.zones[0]
 	c.log_file = "cadence.log"
 	c.environment = make(map[string]string)
 }
 
-func (c *Conf) isZero() bool {
-	if c.client_port == 0 && c.self == "" && c.host_port == 0 {
+func (c *Conf) is_zero() bool {
+	if c.clientPort == 0 && c.self == "" && c.hostPort == 0 {
 		return true
 	}
 	return false

@@ -7,40 +7,42 @@ package cadence
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net"
 	"strconv"
-
-	"github.com/nu7hatch/gouuid"
 )
 
-var local_config Conf
+var localConf Conf
+var futureTasks tasks
+var todayTasks tasks
 
 // Restart the server, performing all necessary tasks and communications, then
 // reload the configuration.
 func Reload() bool {
-	local_config = load()
+	localConf = load()
 	return true
 }
 
-// Start the two listeners, host and client, return channels to caller
+// Start the two listeners, host and client, return client channel to caller
 func Start() chan uint8 {
-	fmt.Print("Starting new client listener ")
-	if local_config.isZero() {
-		local_config = load()
+	name := "Start"
+	if localConf.is_zero() {
+		localConf = load()
 	}
-	fmt.Println("on port ", local_config.client_port)
-	directive := make(chan uint8)
-	go listen_to_client(directive)
-	fmt.Println("Starting new host listener on port", local_config.host_port)
-	return directive
+	log(name, "Cadence is starting")
+	log(name, "Starting new client listener on port " + strconv.Itoa(int(localConf.clientPort)))
+	client := make(chan uint8)
+	dispatcher := make(chan bool)
+	go listenToClient(client, dispatcher)
+	go exclusiveDispatch(dispatcher)
+	return client
 }
 
-// list_to_client waits on connections to the client_port, for configuration instructions
+// listenToClient waits on connections to the client_port, for configuration instructions
 // and shutdown/restart commands, among other things.
-func listen_to_client(directive chan<- uint8) {
-	listener, err := net.Listen("tcp", ":"+strconv.Itoa(int(local_config.client_port)))
+func listenToClient(directive chan<- uint8, dispatcher chan<- bool) {
+	name := "ClientListener"
+	listener, err := net.Listen("tcp", ":"+strconv.Itoa(int(localConf.clientPort)))
 	if err != nil {
 		panic(err)
 	}
@@ -52,44 +54,93 @@ func listen_to_client(directive chan<- uint8) {
 		}
 		reader := bufio.NewReader(conn)
 		message, err := reader.ReadBytes('\n')
-		fmt.Println("Message Received:", string(message))
+		log(name, "Message Received:" + string(message))
 		// Convert message from JSON into Request object and see if a command or task was provided
-		request, err := unmarshall_json_request(message)
+		request, err := unmarshallJSONRequest(message)
 		if err != nil {
 			conn.Write([]byte("Error: " + err.Error() + "\n"))
 		} else {
 			// Determine if a command was sent or a new task request
-			fmt.Println(request)
 			if request.New_task == nil {
-				command := process_command(request.Command.Cmd, request.Command.Value)
+				processCommand(request.Command.Cmd, request.Command.Value, directive)
+			} else {
+				// if New_task is not nil, then we need to handle the new task
+				newID, err := processNewTaskRequest(request.New_task)
+				if err != nil {
+					conn.Write([]byte(err.Error() + "\n"))
+					log(name, "Message Sent: " + err.Error())
+				} else {
+					// All went well, let the user know of the new UUID
+					conn.Write([]byte("New Task ID: " + newID + "\n"))
+					log(name, "New task " + newID + " created")
+					dispatcher <- true
+				}
 			}
 		}
-		id := new_uuid()
-		conn.Write([]byte(id.String() + "\n"))
 	}
 }
 
-func process_command(cmd string, value string) uint8 {
+func processNewTaskRequest(newTaskRequest *NewTaskRequest) (string, error) {
+	// function converts request to Task type, handles default values and ensures all required information is
+	// provided, and if not, return the error message with details back to the client
+	newTask, err := newTaskRequest.toTask()
+	if err == nil {
+		futureTasks.mutex.Lock()
+		futureTasks.items = append(futureTasks.items, newTask)
+		futureTasks.mutex.Unlock()
+		// if task is today, re-update the list of tasks for today
+		if isToday(newTask.start) {
+			todayTasks.mutex.Lock()
+			todayTasks.items = append(todayTasks.items, newTask)
+			todayTasks.mutex.Unlock()
+		}
+		return newTask.id, nil
+	} else {
+		return "", err
+	}
+}
+
+func exclusiveDispatch(taskListUpdate <-chan bool) {
+	// Exclusive Dispatch listens for new tasks being added to today,
+	// for the day to change (midnight), to individual tasks for their wake times,
+	// and to the network for remote task execution mutex negotiation. It then permits
+	// or denies individual tasks from executing on the local system after negotiating
+	// mutex state.
+	waiting := todayTasks.items
+	timer := make(chan string)
+	idToIndex := make(map[string]int)
+	name := "Dispatcher"
+	for {
+		select {
+		case <-taskListUpdate:
+			for _, elem := range todayTasks.items {
+				if !taskListContains(waiting, elem.id) {
+					waiting = append(waiting, elem)
+					idToIndex[elem.id] = len(waiting) - 1
+					log(name, "Added " + elem.id + " to waiting list")
+					go elem.sleep(timer)
+				}
+			}
+		case id := <-timer:
+			log(name, "Task " + id + " woke up")
+			// since we're not yet running on distributed mutex, just fire the task
+			// and it'll take care of itself.
+			if taskListContains(waiting, id) {
+				// We do this to make sure the task wasn't cancelled since it was
+				// put to sleep. If it was, then we're just going to ignore it
+				go waiting[idToIndex[id]].execute()
+			}
+		}
+	}
+}
+
+func processCommand(cmd string, value string, client chan<- uint8) {
 	switch {
 	case cmd == "SHUTDOWN":
-		return DIRECTIVE_SHUTDOWN
+		client <- DIRECTIVE_SHUTDOWN
 	case cmd == "RELOAD":
-		return DIRECTIVE_RELOAD_CONFIG
+		client <- DIRECTIVE_RELOAD_CONFIG
 	default:
-		return DIRECTIVE_UNKNOWN
+		client <- DIRECTIVE_UNKNOWN
 	}
-}
-
-func unmarshall_json_request(json_string []byte) (Request, error) {
-	request := Request{}
-	err := json.Unmarshal(json_string, &request)
-	return request, err
-}
-
-func new_uuid() uuid.UUID {
-	id, err := uuid.NewV4()
-	if err != nil {
-		panic(err)
-	}
-	return *id
 }
